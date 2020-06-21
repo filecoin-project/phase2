@@ -7,15 +7,17 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use ff::{Field, PrimeField};
 use groupy::{CurveAffine, CurveProjective, EncodedPoint, Wnaf};
 use log::{error, info};
-use paired::bls12_381::{Fr, G1 as G1Projective, G1Affine, G1Uncompressed, G2Affine, G2Uncompressed};
+use paired::bls12_381::{
+    Fr, G1Affine, G1Uncompressed, G2Affine, G2Uncompressed, G1 as G1Projective,
+};
 use rand::Rng;
 use rayon::prelude::*;
 
-use crate::{hash_to_g2, HashWriter, merge_pairs, PrivateKey, PublicKey, same_ratio};
+use crate::{hash_to_g2, merge_pairs, same_ratio, HashWriter, PrivateKey, PublicKey};
 
 #[derive(Clone)]
 pub struct MPCSmall {
-    // The Groth16 verification-key's deltas G1 and G2. For all non-initial parameters 
+    // The Groth16 verification-key's deltas G1 and G2. For all non-initial parameters
     // `delta_g1 == contributions.last().delta_after`.
     pub(crate) delta_g1: G1Affine,
     pub(crate) delta_g2: G2Affine,
@@ -29,6 +31,230 @@ pub struct MPCSmall {
     pub(crate) contributions: Vec<PublicKey>,
 }
 
+pub struct Streamer<R: Read + Seek> {
+    delta_g1: G1Affine,
+    delta_g2: G2Affine,
+    h_len: usize,
+    l_len: usize,
+    cs_hash: [u8; 64],
+    contributions: Vec<PublicKey>,
+    reader: R,
+}
+
+impl<R: Read + Seek> Streamer<R> {
+    pub fn new(mut reader: R) -> io::Result<Streamer<R>> {
+        let delta_g1: G1Affine = read_g1(&mut reader)?;
+        let delta_g2: G2Affine = read_g2(&mut reader)?;
+
+        let g1_size = size_of::<G1Uncompressed>();
+
+        let h_len = reader.read_u32::<BigEndian>()? as usize;
+        reader.seek(SeekFrom::Current((h_len * g1_size) as i64))?;
+
+        let l_len = reader.read_u32::<BigEndian>()? as usize;
+        reader.seek(SeekFrom::Current((h_len * g1_size) as i64))?;
+
+        let mut cs_hash = [0u8; 64];
+        reader.read_exact(&mut cs_hash)?;
+
+        let contributions_len = reader.read_u32::<BigEndian>()? as usize;
+        let mut contributions = Vec::<PublicKey>::with_capacity(contributions_len);
+        for _ in 0..contributions_len {
+            contributions.push(PublicKey::read(&mut reader)?);
+        }
+
+        let streamer = Streamer {
+            delta_g1,
+            delta_g2,
+            h_len,
+            l_len,
+            cs_hash,
+            contributions,
+            reader: reader,
+        };
+
+        Ok(streamer)
+    }
+
+    pub fn new_from_large_file(mut reader: R) -> io::Result<Streamer<R>> {
+        /*
+           `MPCParameters` are serialized in the order:
+              vk.alpha_g1
+              vk.beta_g1
+              vk.beta_g2
+              vk.gamma_g2
+              vk.delta_g1
+              vk.delta_g2
+              vk.ic length (4 bytes)
+              vk.ic (G1)
+              h length (4 bytes)
+              h (G1)
+              l length (4 bytes)
+              l (G1)
+              a length (4 bytes)
+              a (G1)
+              b_g1 length (4 bytes)
+              b_g1 (G1)
+              b_g2 length (4 bytes)
+              b_g2 (G2)
+              cs_hash (64 bytes)
+              contributions length (4 bytes)
+              contributions (544 bytes per PublicKey)
+        */
+
+        let g1_size = size_of::<G1Uncompressed>() as u64; // 96 bytes
+        let g2_size = size_of::<G2Uncompressed>() as u64; // 192 bytes
+
+        // Read delta_g1, delta_g2, and ic's length.
+        let delta_g1_offset = g1_size + g1_size + g2_size + g2_size; // + vk.alpha_g1 + vk.beta_g1 + vk.beta_g2 + vk.gamma_g2
+        reader.seek(SeekFrom::Start(delta_g1_offset)).unwrap();
+        let delta_g1 = read_g1(&mut reader)?;
+        let delta_g2 = read_g2(&mut reader)?;
+        let ic_len = reader.read_u32::<BigEndian>()? as u64;
+
+        // Read h's length.
+        let h_len_offset = delta_g1_offset + g1_size + g2_size + 4 + ic_len * g1_size; // + vk.delta_g1 + vk.delta_g2 + ic length + ic
+        reader.seek(SeekFrom::Start(h_len_offset)).unwrap();
+        let h_len = reader.read_u32::<BigEndian>()? as u64;
+
+        // Read l's length.
+        let l_len_offset = h_len_offset + 4 + h_len * g1_size; // + h length + h
+        reader.seek(SeekFrom::Start(l_len_offset)).unwrap();
+        let l_len = reader.read_u32::<BigEndian>()? as u64;
+
+        // Read a's length.
+        let a_len_offset = l_len_offset + 4 + l_len * g1_size; // + l length + l
+        reader.seek(SeekFrom::Start(a_len_offset)).unwrap();
+        let a_len = reader.read_u32::<BigEndian>()? as u64;
+
+        // Read b_g1's length.
+        let b_g1_len_offset = a_len_offset + 4 + a_len * g1_size; // + a length + a
+        reader.seek(SeekFrom::Start(b_g1_len_offset)).unwrap();
+        let b_g1_len = reader.read_u32::<BigEndian>()? as u64;
+
+        // Read b_g2's length.
+        let b_g2_len_offset = b_g1_len_offset + 4 + b_g1_len * g1_size; // + b_g1 length + b_g1
+        reader.seek(SeekFrom::Start(b_g2_len_offset)).unwrap();
+        let b_g2_len = reader.read_u32::<BigEndian>()? as u64;
+
+        // Read cs_hash.
+        let cs_hash_offset = b_g2_len_offset + 4 + b_g2_len * g2_size; // + b_g2 length + b_g2
+        reader.seek(SeekFrom::Start(cs_hash_offset)).unwrap();
+        let mut cs_hash = [0u8; 64];
+        reader.read_exact(&mut cs_hash)?;
+
+        // Read contribution's length.
+        let contributions_len = reader.read_u32::<BigEndian>()? as u64;
+
+        // Read the contributions.
+        let contributions_offset = cs_hash_offset + 64 + 4; // + 64-byte cs_hash + contributions length
+        reader.seek(SeekFrom::Start(contributions_offset)).unwrap();
+        let mut contributions = Vec::<PublicKey>::with_capacity(contributions_len as usize);
+        for _ in 0..contributions_len {
+            contributions.push(PublicKey::read(&mut reader)?);
+        }
+
+        let streamer = Streamer {
+            delta_g1,
+            delta_g2,
+            h_len: h_len as usize,
+            l_len: l_len as usize,
+            cs_hash,
+            contributions,
+            reader: reader,
+        };
+
+        Ok(streamer)
+    }
+
+    pub fn contribute<RR: Rng, W: Write>(
+        &mut self,
+        rng: &mut RR,
+        mut writer: W,
+        chunk_size: usize,
+    ) -> io::Result<[u8; 64]> {
+        let (pubkey, privkey) = keypair(rng, &self.cs_hash, &self.contributions, &self.delta_g1);
+
+        self.delta_g1 = self.delta_g1.mul(privkey.delta).into_affine();
+        self.delta_g2 = self.delta_g2.mul(privkey.delta).into_affine();
+
+        let delta_inv = privkey.delta.inverse().expect("nonzero");
+
+        writer.write_all(self.delta_g1.into_uncompressed().as_ref())?;
+        writer.write_all(self.delta_g2.into_uncompressed().as_ref())?;
+
+        {
+            writer.write_u32::<BigEndian>(self.h_len as u32)?;
+
+            let chunks_to_read = self.h_len;
+
+            let mut chunks_read = 0;
+            let this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
+
+            while this_chunk_size > 0 {
+                // TODO: try to allocate once and reuse buffer.
+                let mut h_chunk = Vec::<G1Affine>::with_capacity(this_chunk_size);
+
+                for _ in 0..this_chunk_size {
+                    h_chunk.push(read_g1(&mut self.reader)?);
+                }
+                chunks_read += this_chunk_size;
+
+                info!("phase2::MPCParameters::contribute() batch_exp of h");
+                batch_exp(&mut h_chunk, delta_inv);
+                info!("phase2::MPCParameters::contribute() finished batch_exp of h");
+
+                for h in h_chunk {
+                    writer.write_all(h.into_uncompressed().as_ref())?;
+                }
+            }
+        }
+        {
+            writer.write_u32::<BigEndian>(self.l_len as u32)?;
+
+            let chunks_to_read = self.l_len;
+
+            let mut chunks_read = 0;
+            let this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
+
+            while this_chunk_size > 0 {
+                // TODO: try to allocate once and reuse buffer.
+                let mut l_chunk = Vec::<G1Affine>::new();
+
+                for _ in 0..this_chunk_size {
+                    l_chunk.push(read_g1(&mut self.reader)?);
+                }
+                chunks_read += this_chunk_size;
+
+                info!("phase2::MPCParameters::contribute() batch_exp of l");
+                batch_exp(&mut l_chunk, delta_inv);
+                info!("phase2::MPCParameters::contribute() finished batch_exp of l");
+
+                for l in l_chunk {
+                    writer.write_all(l.into_uncompressed().as_ref())?;
+                }
+            }
+        }
+
+        self.contributions.push(pubkey.clone());
+
+        writer.write_all(&self.cs_hash)?;
+
+        writer.write_u32::<BigEndian>(self.contributions.len() as u32)?;
+
+        for pubkey in &self.contributions {
+            pubkey.write(&mut writer)?;
+        }
+
+        {
+            let sink = io::sink();
+            let mut sink = HashWriter::new(sink);
+            pubkey.write(&mut sink).unwrap();
+            Ok(sink.into_hash())
+        }
+    }
+}
+
 // Required by `assert_eq!()`.
 impl Debug for MPCSmall {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
@@ -38,7 +264,10 @@ impl Debug for MPCSmall {
             .field("h", &format!("<G1Uncompressed len={}>", self.h.len()))
             .field("l", &format!("<G1Uncompressed len={}>", self.l.len()))
             .field("cs_hash", &self.cs_hash.to_vec())
-            .field("contributions", &format!("<phase2::PublicKey len={}>", self.contributions.len()))
+            .field(
+                "contributions",
+                &format!("<phase2::PublicKey len={}>", self.contributions.len()),
+            )
             .finish()
     }
 }
@@ -56,7 +285,7 @@ impl PartialEq for MPCSmall {
 
 impl MPCSmall {
     pub fn contribute<R: Rng>(&mut self, rng: &mut R) -> [u8; 64] {
-        let (pubkey, privkey) = keypair(rng, self);
+        let (pubkey, privkey) = keypair(rng, &self.cs_hash, &self.contributions, &self.delta_g1);
 
         self.delta_g1 = self.delta_g1.mul(privkey.delta).into_affine();
         self.delta_g2 = self.delta_g2.mul(privkey.delta).into_affine();
@@ -85,7 +314,7 @@ impl MPCSmall {
     pub fn read<R: Read>(mut reader: R) -> io::Result<Self> {
         let delta_g1: G1Affine = read_g1(&mut reader)?;
         let delta_g2: G2Affine = read_g2(&mut reader)?;
-        
+
         let h_len = reader.read_u32::<BigEndian>()? as usize;
         let mut h = Vec::<G1Affine>::with_capacity(h_len);
         for _ in 0..h_len {
@@ -126,7 +355,7 @@ impl MPCSmall {
 
     pub fn write<W: Write>(&self, mut writer: W) -> io::Result<()> {
         writer.write_all(self.delta_g1.into_uncompressed().as_ref())?;
-        writer.write_all(self.delta_g2.into_uncompressed().as_ref())?;        
+        writer.write_all(self.delta_g2.into_uncompressed().as_ref())?;
 
         writer.write_u32::<BigEndian>(self.h.len() as u32)?;
         for h in &*self.h {
@@ -149,7 +378,12 @@ impl MPCSmall {
     }
 }
 
-fn keypair<R: Rng>(rng: &mut R, prev: &MPCSmall) -> (PublicKey, PrivateKey) {
+fn keypair<R: Rng>(
+    rng: &mut R,
+    prev_cs_hash: &[u8; 64],
+    prev_contributions: &[PublicKey],
+    prev_delta_g1: &G1Affine,
+) -> (PublicKey, PrivateKey) {
     // Sample random delta
     let delta: Fr = Fr::random(rng);
 
@@ -162,8 +396,8 @@ fn keypair<R: Rng>(rng: &mut R, prev: &MPCSmall) -> (PublicKey, PrivateKey) {
         let sink = io::sink();
         let mut sink = HashWriter::new(sink);
 
-        sink.write_all(&prev.cs_hash[..]).unwrap();
-        for pubkey in &prev.contributions {
+        sink.write_all(&prev_cs_hash[..]).unwrap();
+        for pubkey in prev_contributions {
             pubkey.write(&mut sink).unwrap();
         }
         sink.write_all(s.into_uncompressed().as_ref()).unwrap();
@@ -183,7 +417,7 @@ fn keypair<R: Rng>(rng: &mut R, prev: &MPCSmall) -> (PublicKey, PrivateKey) {
 
     (
         PublicKey {
-            delta_after: prev.delta_g1.mul(delta).into_affine(),
+            delta_after: prev_delta_g1.mul(delta).into_affine(),
             s,
             s_delta,
             r_delta,
@@ -263,7 +497,9 @@ pub fn verify_contribution_small(before: &MPCSmall, after: &MPCSmall) -> Result<
     // Check that the before params' `delta_g1` and `delta_after` are the same value.
     if before_is_initial {
         if before.delta_g1 != G1Affine::one() || before.delta_g2 != G2Affine::one() {
-            error!("phase2::verify_contribution_small() initial params do not have identity deltas");
+            error!(
+                "phase2::verify_contribution_small() initial params do not have identity deltas"
+            );
         }
     } else {
         let before_pubkey = before.contributions.last().unwrap();
@@ -301,10 +537,12 @@ pub fn verify_contribution_small(before: &MPCSmall, after: &MPCSmall) -> Result<
     for pubkey in &before.contributions {
         pubkey.write(&mut sink).unwrap();
     }
-    sink.write_all(after_pubkey.s.into_uncompressed().as_ref()).unwrap();
-    sink.write_all(after_pubkey.s_delta.into_uncompressed().as_ref()).unwrap();
+    sink.write_all(after_pubkey.s.into_uncompressed().as_ref())
+        .unwrap();
+    sink.write_all(after_pubkey.s_delta.into_uncompressed().as_ref())
+        .unwrap();
     let calculated_after_transcript = sink.into_hash();
-    
+
     // Check the after params transcript against its calculated transcript.
     if &after_pubkey.transcript[..] != calculated_after_transcript.as_ref() {
         error!("phase2::verify_contribution_small() inconsistent transcript");
@@ -315,19 +553,28 @@ pub fn verify_contribution_small(before: &MPCSmall, after: &MPCSmall) -> Result<
 
     // Check the signature of knowledge. Check that the participant's r and s were shifted by the
     // same factor.
-    if !same_ratio((after_r, after_pubkey.r_delta), (after_pubkey.s, after_pubkey.s_delta)) {
+    if !same_ratio(
+        (after_r, after_pubkey.r_delta),
+        (after_pubkey.s, after_pubkey.s_delta),
+    ) {
         error!("phase2::verify_contribution_small() participant's r and s were shifted by different deltas");
         return Err(());
     }
 
     // Check that delta_g1 and r were shifted by the same factor.
-    if !same_ratio((before.delta_g1, after.delta_g1), (after_r, after_pubkey.r_delta)) {
+    if !same_ratio(
+        (before.delta_g1, after.delta_g1),
+        (after_r, after_pubkey.r_delta),
+    ) {
         error!("phase2::verify_contribution_small() participant's delta_g1 and r where shifted by different deltas");
         return Err(());
     }
 
     // Check that delta_g1 and delta_g2 were shifted by the same factor.
-    if !same_ratio((G1Affine::one(), after.delta_g1), (G2Affine::one(), after.delta_g2)) {
+    if !same_ratio(
+        (G1Affine::one(), after.delta_g1),
+        (G2Affine::one(), after.delta_g2),
+    ) {
         error!("phase2::verify_contribution_small() delta_g1 and delta_g2 were shifted by different deltas");
         return Err(());
     }
@@ -347,7 +594,7 @@ pub fn verify_contribution_small(before: &MPCSmall, after: &MPCSmall) -> Result<
         error!("phase2::verify_contribution_small() l was not updated by delta^-1");
         return Err(());
     }
-    
+
     // Calculate the "after" participant's contribution hash.
     let sink = io::sink();
     let mut sink = HashWriter::new(sink);
@@ -359,7 +606,8 @@ pub fn verify_contribution_small(before: &MPCSmall, after: &MPCSmall) -> Result<
 pub fn read_g1<R: Read>(mut reader: R) -> io::Result<G1Affine> {
     let mut affine_bytes = G1Uncompressed::empty();
     reader.read_exact(affine_bytes.as_mut())?;
-    let affine = affine_bytes.into_affine()
+    let affine = affine_bytes
+        .into_affine()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     if affine.is_zero() {
@@ -377,7 +625,8 @@ pub fn read_g1<R: Read>(mut reader: R) -> io::Result<G1Affine> {
 pub fn read_g2<R: Read>(mut reader: R) -> io::Result<G2Affine> {
     let mut affine_bytes = G2Uncompressed::empty();
     reader.read_exact(affine_bytes.as_mut())?;
-    let affine = affine_bytes.into_affine()
+    let affine = affine_bytes
+        .into_affine()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     if affine.is_zero() {
