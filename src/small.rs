@@ -11,7 +11,6 @@ use paired::bls12_381::{
     Fr, G1Affine, G1Uncompressed, G2Affine, G2Uncompressed, G1 as G1Projective,
 };
 use rand::Rng;
-use rayon::prelude::*;
 
 use crate::{hash_to_g2, merge_pairs, same_ratio, HashWriter, PrivateKey, PublicKey};
 
@@ -453,23 +452,19 @@ fn batch_exp(bases: &mut [G1Affine], coeff: Fr) {
                 for (base, products) in bases.iter_mut().zip(products.iter_mut()) {
                     *products = wnaf.base(base.into_projective(), 1).scalar(coeff);
                 }
+                // Normalize the projective products.
+                G1Projective::batch_normalization(products);
+
+                bases
+                    .iter_mut()
+                    .zip(products.iter())
+                    .for_each(|(affine, projective)| {
+                        *affine = projective.into_affine();
+                    });
             });
         }
     })
     .unwrap();
-
-    // Normalize the projective products.
-    products
-        .par_chunks_mut(chunk_size)
-        .for_each(|batch| G1Projective::batch_normalization(batch));
-
-    // Convert the normalized projective points back to affine.
-    bases
-        .par_iter_mut()
-        .zip(products.par_iter())
-        .for_each(|(affine, projective)| {
-            *affine = projective.into_affine();
-        });
 }
 
 pub fn verify_contribution_small(before: &MPCSmall, after: &MPCSmall) -> Result<[u8; 64], ()> {
