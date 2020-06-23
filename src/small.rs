@@ -41,6 +41,7 @@ pub struct Streamer<R: Read + Seek> {
 }
 
 impl<R: Read + Seek> Streamer<R> {
+    // Create a new `Streamer` from small params file, with reader in position to begin reading the h vector.
     pub fn new(mut reader: R) -> io::Result<Streamer<R>> {
         let delta_g1: G1Affine = read_g1(&mut reader)?;
         let delta_g2: G2Affine = read_g2(&mut reader)?;
@@ -80,6 +81,7 @@ impl<R: Read + Seek> Streamer<R> {
         Ok(streamer)
     }
 
+    // Create a new `Streamer` from large params file, with reader in position to begin reading the h vector.
     pub fn new_from_large_file(mut reader: R) -> io::Result<Streamer<R>> {
         /*
            `MPCParameters` are serialized in the order:
@@ -198,10 +200,9 @@ impl<R: Read + Seek> Streamer<R> {
             let mut chunks_read = 0;
             let mut this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
 
+            let mut h_chunk = Vec::<G1Affine>::with_capacity(this_chunk_size);
+            info!("phase2::MPCParameters::contribute() beginning streaming h");
             while this_chunk_size > 0 {
-                // TODO: try to allocate once and reuse buffer.
-                let mut h_chunk = Vec::<G1Affine>::with_capacity(this_chunk_size);
-
                 for _ in 0..this_chunk_size {
                     h_chunk.push(read_g1(&mut self.reader)?);
                 }
@@ -211,12 +212,14 @@ impl<R: Read + Seek> Streamer<R> {
                 batch_exp(&mut h_chunk, delta_inv);
                 info!("phase2::MPCParameters::contribute() finished batch_exp of h");
 
-                for h in h_chunk {
+                for h in &h_chunk {
                     writer.write(h.into_uncompressed().as_ref())?;
                 }
 
                 this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
+                h_chunk.truncate(0);
             }
+            info!("phase2::MPCParameters::contribute() finished streaming h");
         }
         // Skip l_len (TODO: should we just read h_len and l_len while writing, rather than in advance?)
         self.reader.seek(SeekFrom::Current(4))?;
@@ -227,10 +230,9 @@ impl<R: Read + Seek> Streamer<R> {
             let mut chunks_read = 0;
             let mut this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
 
+            let mut l_chunk = Vec::<G1Affine>::new();
+            info!("phase2::MPCParameters::contribute() beginning streaming l");
             while this_chunk_size > 0 {
-                // TODO: try to allocate once and reuse buffer.
-                let mut l_chunk = Vec::<G1Affine>::new();
-
                 for _ in 0..this_chunk_size {
                     l_chunk.push(read_g1(&mut self.reader)?);
                 }
@@ -240,12 +242,14 @@ impl<R: Read + Seek> Streamer<R> {
                 batch_exp(&mut l_chunk, delta_inv);
                 info!("phase2::MPCParameters::contribute() finished batch_exp of l");
 
-                for l in l_chunk {
+                for l in &l_chunk {
                     writer.write(l.into_uncompressed().as_ref())?;
                 }
 
                 this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
+                l_chunk.truncate(0);
             }
+            info!("phase2::MPCParameters::contribute() finished streaming l");
         }
 
         self.contributions.push(pubkey.clone());
