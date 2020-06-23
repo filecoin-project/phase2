@@ -46,12 +46,14 @@ impl<R: Read + Seek> Streamer<R> {
         let delta_g2: G2Affine = read_g2(&mut reader)?;
 
         let g1_size = size_of::<G1Uncompressed>();
+        let g2_size = size_of::<G2Uncompressed>();
 
         let h_len = reader.read_u32::<BigEndian>()? as usize;
+        let h_offset = g1_size + g2_size + 4;
         reader.seek(SeekFrom::Current((h_len * g1_size) as i64))?;
 
         let l_len = reader.read_u32::<BigEndian>()? as usize;
-        reader.seek(SeekFrom::Current((h_len * g1_size) as i64))?;
+        reader.seek(SeekFrom::Current((l_len * g1_size) as i64))?;
 
         let mut cs_hash = [0u8; 64];
         reader.read_exact(&mut cs_hash)?;
@@ -61,6 +63,9 @@ impl<R: Read + Seek> Streamer<R> {
         for _ in 0..contributions_len {
             contributions.push(PublicKey::read(&mut reader)?);
         }
+
+        // Rewind reader to where we will beginning streaming.
+        reader.seek(SeekFrom::Start(h_offset as u64)).unwrap();
 
         let streamer = Streamer {
             delta_g1,
@@ -115,6 +120,7 @@ impl<R: Read + Seek> Streamer<R> {
         let h_len_offset = delta_g1_offset + g1_size + g2_size + 4 + ic_len * g1_size; // + vk.delta_g1 + vk.delta_g2 + ic length + ic
         reader.seek(SeekFrom::Start(h_len_offset)).unwrap();
         let h_len = reader.read_u32::<BigEndian>()? as u64;
+        let h_offset = h_len_offset + 4;
 
         // Read l's length.
         let l_len_offset = h_len_offset + 4 + h_len * g1_size; // + h length + h
@@ -153,6 +159,9 @@ impl<R: Read + Seek> Streamer<R> {
             contributions.push(PublicKey::read(&mut reader)?);
         }
 
+        // Rewind reader to where we will beginning streaming.
+        reader.seek(SeekFrom::Start(h_offset)).unwrap();
+
         let streamer = Streamer {
             delta_g1,
             delta_g2,
@@ -179,16 +188,15 @@ impl<R: Read + Seek> Streamer<R> {
 
         let delta_inv = privkey.delta.inverse().expect("nonzero");
 
-        writer.write_all(self.delta_g1.into_uncompressed().as_ref())?;
-        writer.write_all(self.delta_g2.into_uncompressed().as_ref())?;
+        writer.write(self.delta_g1.into_uncompressed().as_ref())?;
+        writer.write(self.delta_g2.into_uncompressed().as_ref())?;
 
         {
             writer.write_u32::<BigEndian>(self.h_len as u32)?;
 
             let chunks_to_read = self.h_len;
-
             let mut chunks_read = 0;
-            let this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
+            let mut this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
 
             while this_chunk_size > 0 {
                 // TODO: try to allocate once and reuse buffer.
@@ -204,17 +212,20 @@ impl<R: Read + Seek> Streamer<R> {
                 info!("phase2::MPCParameters::contribute() finished batch_exp of h");
 
                 for h in h_chunk {
-                    writer.write_all(h.into_uncompressed().as_ref())?;
+                    writer.write(h.into_uncompressed().as_ref())?;
                 }
+
+                this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
             }
         }
+        // Skip l_len (TODO: should we just read h_len and l_len while writing, rather than in advance?)
+        self.reader.seek(SeekFrom::Current(4))?;
         {
             writer.write_u32::<BigEndian>(self.l_len as u32)?;
 
             let chunks_to_read = self.l_len;
-
             let mut chunks_read = 0;
-            let this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
+            let mut this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
 
             while this_chunk_size > 0 {
                 // TODO: try to allocate once and reuse buffer.
@@ -230,14 +241,16 @@ impl<R: Read + Seek> Streamer<R> {
                 info!("phase2::MPCParameters::contribute() finished batch_exp of l");
 
                 for l in l_chunk {
-                    writer.write_all(l.into_uncompressed().as_ref())?;
+                    writer.write(l.into_uncompressed().as_ref())?;
                 }
+
+                this_chunk_size = usize::min(chunk_size, chunks_to_read - chunks_read);
             }
         }
 
         self.contributions.push(pubkey.clone());
 
-        writer.write_all(&self.cs_hash)?;
+        writer.write(&self.cs_hash)?;
 
         writer.write_u32::<BigEndian>(self.contributions.len() as u32)?;
 
